@@ -21,6 +21,7 @@ import java.util.Collections;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.TimeUnit;
 
 import javax.management.MBeanServer;
 import javax.transaction.xa.XAException;
@@ -29,18 +30,20 @@ import javax.transaction.xa.Xid;
 import net.sf.ehcache.Cache;
 import net.sf.ehcache.CacheManager;
 import net.sf.ehcache.Element;
+import net.sf.ehcache.config.CacheConfiguration;
 import net.sf.ehcache.management.ManagementService;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
-import org.javasimon.Counter;
-import org.javasimon.SimonManager;
-import org.javasimon.Split;
-import org.javasimon.Stopwatch;
 import org.nuxeo.ecm.core.storage.StorageException;
 import org.nuxeo.ecm.core.storage.sql.ACLRow.ACLRowPositionComparator;
 import org.nuxeo.ecm.core.storage.sql.Invalidations.InvalidationsPair;
-import org.nuxeo.runtime.api.Framework;
+
+import com.yammer.metrics.Metrics;
+import com.yammer.metrics.core.Counter;
+import com.yammer.metrics.core.Gauge;
+import com.yammer.metrics.core.Timer;
+import com.yammer.metrics.core.TimerContext;
 
 /**
  * A {@link RowMapper} that use an unified ehcache.
@@ -54,19 +57,8 @@ public class UnifiedCachingRowMapper implements RowMapper {
 
     private static final String ABSENT = "__ABSENT__\0\0\0";
 
-    /**
-     * The cached rows. All held data is identical to what is present in the
-     * underlying {@link RowMapper} and could be refetched if needed.
-     * <p>
-     * The values are either {@link Row} for fragments present in the database,
-     * or a row with tableName {@link #ABSENT} to denote a fragment known to be
-     * absent from the database.
-     * <p>
-     * This cache is memory-sensitive (all values are soft-referenced), a
-     * fragment can always be refetched if the GC collects it.
-     */
-    // we use a new Row instance for the absent case to avoid keeping other
-    // references to it which would prevent its GCing
+    private static CacheManager cacheManager = null;
+
     private Cache cache;
 
     private Model model;
@@ -112,30 +104,11 @@ public class UnifiedCachingRowMapper implements RowMapper {
 
     protected boolean forRemoteClient;
 
-    /**
-     * Cache statistics
-     */
-    // JavaSimpon Counter Names
-    private static final String CN_ACCESS = "org.nuxeo.ecm.core.storage.sql.row.cache.access";
-
-    private static final String CN_HITS = "org.nuxeo.ecm.core.storage.sql.row.cache.hits";
-
-    private static final String CN_SIZE = "org.nuxeo.ecm.core.storage.sql.row.cache.size";
-
-    // Stop watch for cache access
-    private static final String SW_CACHE = "org.nuxeo.ecm.core.storage.sql.row.cache.get";
-
-    // Stop watch for SOR access (System Of Record i.e the db access)
-    private static final String SW_SOR = "org.nuxeo.ecm.core.storage.sql.row.sor.gets";
-
-    // Property to enable stop watch
-    private static final String CACHE_STATS_PROP = "org.nuxeo.vcs.cache.statistics";
-
     private static final String CACHE_NAME = "unifiedVCSCache";
 
-    private static final int DEFAULT_CACHE_SIZE = 50000;
+    private static final String CACHE_SIZE_PROP = "maxEntriesLocalHeap";
 
-    private static final String CACHE_SIZE_PROP = "maxElementsInMemory";
+    private static final String CACHE_DISK_SIZE_PROP = "maxEntriesLocalDisk";
 
     private static final String CACHE_ETERNAL_PROP = "eternal";
 
@@ -145,20 +118,45 @@ public class UnifiedCachingRowMapper implements RowMapper {
 
     private static final String CACHE_TIME_TO_IDLE_PROP = "timeToIdleSeconds";
 
-    private long accessCount;
+    private static final String CACHE_STATISTICS_PROP = "statistics";
 
-    private long hitsCount;
+    private static final String CACHE_DISK_PERSISTENT_PROP = "diskPersistent";
 
-    private long cacheSize;
+    /**
+     * Cache statistics
+     *
+     * @since 5.7
+     */
+    private final Counter cacheHitCount = Metrics.defaultRegistry().newCounter(
+            UnifiedCachingRowMapper.class, "cache-hit");
 
-    private boolean cacheStatistics;
+    private final Gauge<Integer> cacheSize = Metrics.defaultRegistry().newGauge(
+            UnifiedCachingRowMapper.class, "cache-size", new Gauge<Integer>() {
+                @Override
+                public Integer getValue() {
+                    if (cacheManager != null) {
+                        return cacheManager.getCache(CACHE_NAME).getSize();
+                    }
+                    return 0;
+                }
+            });
+
+    private final Timer cacheGetTimer = Metrics.defaultRegistry().newTimer(
+            UnifiedCachingRowMapper.class, "cache-get", TimeUnit.MICROSECONDS,
+            TimeUnit.SECONDS);
+
+    // sor means system of record (database access)
+    private final Counter sorRows = Metrics.defaultRegistry().newCounter(
+            UnifiedCachingRowMapper.class, "sor-rows");
+
+    private final Timer sorGetTimer = Metrics.defaultRegistry().newTimer(
+            UnifiedCachingRowMapper.class, "sor-get", TimeUnit.MICROSECONDS,
+            TimeUnit.SECONDS);
 
     public UnifiedCachingRowMapper() {
         localInvalidations = new Invalidations();
         cacheQueue = new InvalidationsQueue("mapper-" + this);
         forRemoteClient = false;
-        String prop = Framework.getProperty(CACHE_STATS_PROP, "false");
-        cacheStatistics = Boolean.parseBoolean(prop);
     }
 
     public void initialize(Model model, RowMapper rowMapper,
@@ -173,53 +171,71 @@ public class UnifiedCachingRowMapper implements RowMapper {
         eventQueue = repositoryEventQueue;
         this.eventPropagator = eventPropagator;
         eventPropagator.addQueue(repositoryEventQueue);
-        cache = CacheManager.getInstance().getCache(CACHE_NAME);
-        if (cache == null) {
-            CacheManager cacheManager = CacheManager.create();
-            // default cache configuration
-            int maxElementsInMemory = DEFAULT_CACHE_SIZE;
-            boolean overflowToDisk = false;
-            boolean eternal = true;
-            long timeToLiveSeconds = 0;
-            long timeToIdleSeconds = 0;
+        if (cacheManager == null) {
+            cacheManager = CacheManager.create();
+            log.info("Creating ehcache manager for VCS, disk store path: "
+                    + cacheManager.getDiskStorePath());
+            cache = cacheManager.getCache(CACHE_NAME);
+            CacheConfiguration config = cache.getCacheConfiguration();
             // override with properties
             if (properties.containsKey(CACHE_SIZE_PROP)) {
-                maxElementsInMemory = Integer.valueOf(
-                        properties.get(CACHE_SIZE_PROP)).intValue();
+                int value = Integer.valueOf(properties.get(CACHE_SIZE_PROP)).intValue();
+                config.setMaxEntriesLocalHeap(value);
+            }
+            if (properties.containsKey(CACHE_DISK_SIZE_PROP)) {
+                int value = Integer.valueOf(
+                        properties.get(CACHE_DISK_SIZE_PROP)).intValue();
+                config.setMaxEntriesLocalDisk(value);
             }
             if (properties.containsKey(CACHE_ETERNAL_PROP)) {
-                eternal = Boolean.valueOf(properties.get(CACHE_ETERNAL_PROP)).booleanValue();
+                boolean value = Boolean.valueOf(
+                        properties.get(CACHE_ETERNAL_PROP)).booleanValue();
+                config.setEternal(value);
             }
             if (properties.containsKey(CACHE_OVERFLOW_TO_DISK_PROP)) {
-                eternal = Boolean.valueOf(
+                boolean value = Boolean.valueOf(
                         properties.get(CACHE_OVERFLOW_TO_DISK_PROP)).booleanValue();
+                config.setOverflowToDisk(value);
             }
             if (properties.containsKey(CACHE_TIME_TO_LIVE_PROP)) {
-                timeToLiveSeconds = Long.valueOf(
+                long value = Long.valueOf(
                         properties.get(CACHE_TIME_TO_LIVE_PROP)).longValue();
+                config.setTimeToLiveSeconds(value);
             }
             if (properties.containsKey(CACHE_TIME_TO_IDLE_PROP)) {
-                timeToIdleSeconds = Long.valueOf(
+                long value = Long.valueOf(
                         properties.get(CACHE_TIME_TO_IDLE_PROP)).longValue();
+                config.setTimeToIdleSeconds(value);
             }
-            Cache memoryOnlyCache = new Cache(CACHE_NAME, maxElementsInMemory,
-                    overflowToDisk, eternal, timeToLiveSeconds,
-                    timeToIdleSeconds);
-            cacheManager.addCache(memoryOnlyCache);
-            cache = cacheManager.getCache(CACHE_NAME);
-            log.info("Created ehcache for VCS Row, size: "
-                    + maxElementsInMemory);
-            // expose to JMX
+            if (properties.containsKey(CACHE_OVERFLOW_TO_DISK_PROP)) {
+                boolean value = Boolean.valueOf(
+                        properties.get(CACHE_STATISTICS_PROP)).booleanValue();
+                config.setStatistics(value);
+            }
+            if (properties.containsKey(CACHE_DISK_PERSISTENT_PROP)) {
+                boolean value = Boolean.valueOf(
+                        properties.get(CACHE_DISK_PERSISTENT_PROP)).booleanValue();
+                config.setDiskPersistent(value);
+            }
+
+            log.info("Creating ehcache " + CACHE_NAME + " size: "
+                    + config.getMaxEntriesLocalHeap());
+            // Exposes cache to JMX
             MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
-            ManagementService.registerMBeans(cacheManager, mBeanServer, false,
-                    false, false, true);
+            ManagementService.registerMBeans(cacheManager, mBeanServer, true,
+                    true, true, true);
         }
+        cache = cacheManager.getCache(CACHE_NAME);
     }
 
     public void close() throws StorageException {
         cachePropagator.removeQueue(cacheQueue);
         eventPropagator.removeQueue(eventQueue); // TODO can be overriden
-        logCacheStat();
+    }
+
+    @Override
+    public Serializable generateNewId() throws StorageException {
+        return rowMapper.generateNewId();
     }
 
     /*
@@ -273,61 +289,23 @@ public class UnifiedCachingRowMapper implements RowMapper {
     }
 
     protected Row cacheGet(RowId rowId) {
-        Split split = null;
-        if (cacheStatistics) {
-            Stopwatch stopWatch = SimonManager.getStopwatch(SW_CACHE);
-            split = stopWatch.start();
-        }
-        Element element = cache.get(rowId);
-        Row row = null;
-        if (element != null) {
-            row = (Row) element.getObjectValue();
-        }
-        if (row != null && !isAbsent(row)) {
-            row = row.clone();
-        }
-        if (split != null) {
-            split.stop();
-        }
-        updateCacheStat(row);
-        return row;
-    }
-
-    private void updateCacheStat(Row row) {
-        if (row != null) {
-            hitsCount++;
-        }
-        if ((++accessCount % 200) == 0) {
-            Counter accessCounter = SimonManager.getCounter(CN_ACCESS);
-            accessCounter.increase(accessCount);
-            accessCount = 0;
-            Counter hitsCounter = SimonManager.getCounter(CN_HITS);
-            hitsCounter.increase(hitsCount);
-            hitsCount = 0;
-            Counter sizeCounter = SimonManager.getCounter(CN_SIZE);
-            long delta = cache.getSize() - cacheSize;
-            if (delta > 0) {
-                sizeCounter.increase(delta);
-            } else if (delta < 0) {
-                sizeCounter.decrease(-1 * delta);
+        final TimerContext context = cacheGetTimer.time();
+        try {
+            Element element = cache.get(rowId);
+            Row row = null;
+            if (element != null) {
+                row = (Row) element.getObjectValue();
             }
-            cacheSize = cache.getSize();
+            if (row != null && !isAbsent(row)) {
+                row = row.clone();
+            }
+            if (row != null) {
+                cacheHitCount.inc();
+            }
+            return row;
+        } finally {
+            context.stop();
         }
-    }
-
-    private void logCacheStat() {
-        if (cacheStatistics) {
-            Stopwatch stopWatch = SimonManager.getStopwatch(SW_CACHE);
-            log.info(stopWatch);
-            stopWatch = SimonManager.getStopwatch(SW_SOR);
-            log.info(stopWatch);
-        }
-        Counter counter = SimonManager.getCounter(CN_ACCESS);
-        log.info(counter);
-        counter = SimonManager.getCounter(CN_HITS);
-        log.info(counter);
-        counter = SimonManager.getCounter(CN_SIZE);
-        log.info(counter);
     }
 
     protected void cacheRemove(RowId rowId) {
@@ -463,21 +441,19 @@ public class UnifiedCachingRowMapper implements RowMapper {
             }
         }
         if (!todo.isEmpty()) {
-            Split split = null;
-            if (cacheStatistics) {
-                Stopwatch stopWatch = SimonManager.getStopwatch(SW_SOR);
-                split = stopWatch.start();
-            }
-            // ask missing ones to underlying row mapper
-            List<? extends RowId> fetched = rowMapper.read(todo, cacheOnly);
-            // add them to the cache
-            for (RowId rowId : fetched) {
-                cachePutAbsentIfRowId(rowId);
-            }
-            // merge results
-            res.addAll(fetched);
-            if (split != null) {
-                split.stop();
+            final TimerContext context = sorGetTimer.time();
+            try {
+                // ask missing ones to underlying row mapper
+                List<? extends RowId> fetched = rowMapper.read(todo, cacheOnly);
+                // add them to the cache
+                for (RowId rowId : fetched) {
+                    cachePutAbsentIfRowId(rowId);
+                }
+                // merge results
+                res.addAll(fetched);
+                sorRows.inc(fetched.size());
+            } finally {
+                context.stop();
             }
         }
         return res;
