@@ -1,8 +1,7 @@
 <ehcache name="vcs" updateCheck="false">
 
-  <diskStore path="java.io.tmpdir/vcs-cache"/>
+  <diskStore path="java.io.tmpdir"/>
 
-  <!-- this can be overridden using default-repository-config.xml cachingMapper properties  -->
   <cache name="unifiedVCSCache"
     maxEntriesLocalHeap="10000"
     maxEntriesLocalDisk="100000"
@@ -12,5 +11,6 @@
     overflowToDisk="true"
     diskPersistent="false"
     memoryStoreEvictionPolicy="LRU"
-    statistics="true"/>
+    statistics="true">
+    </cache>
 </ehcache>

@@ -1,6 +1,7 @@
 # Nuxeo Unified VCS Row Cache
 
 This addon implements a VCS CachingMapper that use a unified ehcache.
+This is an EXPERIMENTAL implementation, not for production use.
 
 ## Configuration
 
@@ -11,14 +12,16 @@ following configuration in "default-repository-config.xml" inside the "repositor
 tag:
 
     <cachingMapper enabled="true" class="org.nuxeo.ecm.core.storage.sql.UnifiedCachingMapper">
-      <property name="maxElementsInMemeory">50000</property>
-      <property name="overflowToDisk">false</property>
-      <property name="eternal">true</property>
-      <property name="timeToLiveSeconds">0</property>
-      <property name="timeToIdleSeconds">0</property>
-    </cachingMapper>	
+      <property name="ehcacheFilePath">/full/path/to/vcs-ehcache.xml</property>
+    </cachingMapper>
 
-Please refer to [ehcache documentation] [5] for information about the properties.
+
+There are 2 examples of ehcache configuration in the
+src/main/resources/ directory, there is one that enable the ehcache XA
+mode and should provide the same isolation as the default SoftRef
+cache.
+
+Please refer to [ehcache documentation] [5] for information about the ehcache configuration.
 
 [5]: http://ehcache.org/apidocs/net/sf/ehcache/Cache.html#Cache%28java.lang.String,%20int,%20boolean,%20boolean,%20long,%20long%29
 

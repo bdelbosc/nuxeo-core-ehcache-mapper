@@ -34,6 +34,7 @@ import net.sf.ehcache.Element;
 import net.sf.ehcache.config.CacheConfiguration;
 import net.sf.ehcache.config.PinningConfiguration;
 import net.sf.ehcache.management.ManagementService;
+import net.sf.ehcache.transaction.manager.TransactionManagerLookup;
 
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
@@ -124,6 +125,8 @@ public class UnifiedCachingRowMapper implements RowMapper {
 
     private static final String CACHE_DISK_PERSISTENT_PROP = "diskPersistent";
 
+    private static final String EHCACHE_FILE_PROP = "ehcacheFilePath";
+
     private static AtomicInteger rowMapperCount = new AtomicInteger();
 
     /**
@@ -163,7 +166,7 @@ public class UnifiedCachingRowMapper implements RowMapper {
         forRemoteClient = false;
     }
 
-    public void initialize(Model model, RowMapper rowMapper,
+    synchronized public void initialize(Model model, RowMapper rowMapper,
             InvalidationsPropagator cachePropagator,
             InvalidationsPropagator eventPropagator,
             InvalidationsQueue repositoryEventQueue,
@@ -176,54 +179,15 @@ public class UnifiedCachingRowMapper implements RowMapper {
         this.eventPropagator = eventPropagator;
         eventPropagator.addQueue(repositoryEventQueue);
         if (cacheManager == null) {
-            cacheManager = CacheManager.create();
-            log.info("Creating ehcache manager for VCS, disk store path: "
-                    + cacheManager.getDiskStorePath());
-            cache = cacheManager.getCache(CACHE_NAME);
-            CacheConfiguration config = cache.getCacheConfiguration();
-            // override with properties
-            if (properties.containsKey(CACHE_SIZE_PROP)) {
-                int value = Integer.valueOf(properties.get(CACHE_SIZE_PROP)).intValue();
-                config.setMaxEntriesLocalHeap(value);
+            if (properties.containsKey(EHCACHE_FILE_PROP)) {
+                String value = properties.get(EHCACHE_FILE_PROP);
+                log.info("Creating ehcache manager for VCS, using ehcache file: "
+                        + value);
+                cacheManager = CacheManager.create(value);
+            } else {
+                log.info("Creating ehcache manager for VCS, No ehcache file provided");
+                cacheManager = CacheManager.create();
             }
-            if (properties.containsKey(CACHE_DISK_SIZE_PROP)) {
-                int value = Integer.valueOf(
-                        properties.get(CACHE_DISK_SIZE_PROP)).intValue();
-                config.setMaxEntriesLocalDisk(value);
-                config.setMaxElementsOnDisk(value);
-            }
-            if (properties.containsKey(CACHE_ETERNAL_PROP)) {
-                boolean value = Boolean.valueOf(
-                        properties.get(CACHE_ETERNAL_PROP)).booleanValue();
-                config.setEternal(value);
-            }
-            if (properties.containsKey(CACHE_OVERFLOW_TO_DISK_PROP)) {
-                boolean value = Boolean.valueOf(
-                        properties.get(CACHE_OVERFLOW_TO_DISK_PROP)).booleanValue();
-                config.setOverflowToDisk(value);
-            }
-            if (properties.containsKey(CACHE_TIME_TO_LIVE_PROP)) {
-                long value = Long.valueOf(
-                        properties.get(CACHE_TIME_TO_LIVE_PROP)).longValue();
-                config.setTimeToLiveSeconds(value);
-            }
-            if (properties.containsKey(CACHE_TIME_TO_IDLE_PROP)) {
-                long value = Long.valueOf(
-                        properties.get(CACHE_TIME_TO_IDLE_PROP)).longValue();
-                config.setTimeToIdleSeconds(value);
-            }
-            if (properties.containsKey(CACHE_OVERFLOW_TO_DISK_PROP)) {
-                boolean value = Boolean.valueOf(
-                        properties.get(CACHE_STATISTICS_PROP)).booleanValue();
-                config.setStatistics(value);
-            }
-            if (properties.containsKey(CACHE_DISK_PERSISTENT_PROP)) {
-                boolean value = Boolean.valueOf(
-                        properties.get(CACHE_DISK_PERSISTENT_PROP)).booleanValue();
-                config.setDiskPersistent(value);
-            }
-            log.info("Creating ehcache " + CACHE_NAME + " size: "
-                    + config.getMaxEntriesLocalHeap());
             // Exposes cache to JMX
             MBeanServer mBeanServer = ManagementFactory.getPlatformMBeanServer();
             ManagementService.registerMBeans(cacheManager, mBeanServer, true,
@@ -231,16 +195,12 @@ public class UnifiedCachingRowMapper implements RowMapper {
         }
         rowMapperCount.incrementAndGet();
         cache = cacheManager.getCache(CACHE_NAME);
-
     }
 
     public void close() throws StorageException {
         cachePropagator.removeQueue(cacheQueue);
         eventPropagator.removeQueue(eventQueue); // TODO can be overriden
-        if (rowMapperCount.decrementAndGet() == 0) {
-            log.info("Shutdown ehcache manager");
-            cacheManager.shutdown();
-        }
+        rowMapperCount.decrementAndGet();
     }
 
     @Override
